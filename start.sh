@@ -74,6 +74,41 @@ MODE="${MODE:-dspark}"                 # fixed K5 DSpark speculative draft
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"   # 256k needs the extra ~1.2 GiB (0.93 leaves only 6.32 GiB KV < 6.99 needed). Boot-safe BECAUSE restart: on-failure:1 can never loop: worst case one clean exit. Requires free host RAM >= 0.94*121.63 = 114.3 GiB at launch (check free -h; stop the old container first).
 VERIFY_MODEL_CHECKSUMS="${VERIFY_MODEL_CHECKSUMS:-1}"
 
+# --- Runtime refusal-direction ablation (OFF by default) -------------------
+# wo_b-output refusal-direction projection in the patched
+# image-patch/vllm/models/deepseek_v4/nvidia/model.py. Opt-in only: set
+# ABLATE=1 (env override, or edit the default below) to enable. A default
+# direction ships with the repo (files/direction_r1.pt, MIT-licensed, from
+# drowzeys' abliterated release — see files/README.md) and is auto-
+# provisioned into ./data/files/ on the first ABLATE=1 boot; drop your own
+# your own unit-norm 4096-dim .pt there to override (never overwritten).
+# LAMBDA/LAYERS default to the published recipe: lam=3.5, layers 10-42
+# (stock 0-9); DSpark draft layers (43+) are never touched. ABLATE=0
+# (default) keeps serving byte-identical to stock. DSV4_ABLATE_FILE set
+# explicitly overrides the default path.
+ABLATE="${ABLATE:-1}"   # 0=off (default) | 1=refusal-direction ablation ON
+case "$ABLATE" in
+  0|1) ;;
+  *) echo "ERROR: ABLATE must be 0 or 1 (got '$ABLATE')" >&2; exit 1 ;;
+esac
+DSV4_ABLATE_FILE="${DSV4_ABLATE_FILE:-}"
+if [ -z "$DSV4_ABLATE_FILE" ] && [ "$ABLATE" = "1" ]; then
+  # Auto-provision the bundled direction on first use; a pre-existing
+  # data/files/direction_r1.pt (user-supplied) always wins.
+  if [ ! -f "${SCRIPT_DIR}/data/files/direction_r1.pt" ] \
+     && [ -f "${SCRIPT_DIR}/files/direction_r1.pt" ]; then
+    mkdir -p "${SCRIPT_DIR}/data/files"
+    cp "${SCRIPT_DIR}/files/direction_r1.pt" "${SCRIPT_DIR}/data/files/"
+  fi
+  if [ ! -f "${SCRIPT_DIR}/data/files/direction_r1.pt" ]; then
+    echo "ERROR: ABLATE=1: no direction file at ./data/files/direction_r1.pt (and no bundled copy in ./files/)" >&2
+    exit 1
+  fi
+  DSV4_ABLATE_FILE="/models/files/direction_r1.pt"
+fi
+DSV4_ABLATE_LAMBDA="${DSV4_ABLATE_LAMBDA:-3.5}"
+DSV4_ABLATE_LAYERS="${DSV4_ABLATE_LAYERS:-10-42}"
+
 # --- 256k KV-record layout (improve-context.md levers #1 / #2) -----------
 # The image ships the FAT 584-byte padded FP8-compat KV record
 # (VLLM_DSV4_PADDED_NVFP4=1). Smaller native NVFP4 records give +35%..+59%
@@ -441,6 +476,11 @@ services:
       VLLM_USE_B12X_WO_PROJECTION: "1"
       GPU_MEMORY_UTILIZATION: "${GPU_MEMORY_UTILIZATION}"
       VERIFY_MODEL_CHECKSUMS: "${VERIFY_MODEL_CHECKSUMS}"
+      # Runtime refusal-direction ablation (image-patch/vllm/models/
+      # deepseek_v4/nvidia/model.py). Empty DSV4_ABLATE_FILE = disabled.
+      DSV4_ABLATE_FILE: "${DSV4_ABLATE_FILE}"
+      DSV4_ABLATE_LAMBDA: "${DSV4_ABLATE_LAMBDA}"
+      DSV4_ABLATE_LAYERS: "${DSV4_ABLATE_LAYERS}"
       # CudaGraph capture sizes (P2). Empty = image default.
       MAX_CUDAGRAPH_CAPTURE_SIZE: "${CAPTURE_SIZE_ENV}"
       CUDAGRAPH_CAPTURE_SIZES: "${CAPTURE_SIZES_ENV}"
@@ -499,6 +539,13 @@ services:
         source: "${SCRIPT_DIR}/image-patch/vllm/models/deepseek_v4/nvidia/dspark.py"
         target: /opt/vllm/vllm/models/deepseek_v4/nvidia/dspark.py
         read_only: true
+      # Runtime refusal-direction ablation hook on target decoder layers
+      # (wo_b output-space projection; fully disabled unless DSV4_ABLATE_FILE
+      # is set — see image-patch/vllm/models/deepseek_v4/nvidia/model.py).
+      - type: bind
+        source: "${SCRIPT_DIR}/image-patch/vllm/models/deepseek_v4/nvidia/model.py"
+        target: /opt/vllm/vllm/models/deepseek_v4/nvidia/model.py
+        read_only: true
       # SparkInfer NVFP4 prefill (>=7-token prompts) fixes: the DSV4
       # dual-cache prefill path mis-dispatched and mis-gathered for native
       # 432-byte NVFP4 KV records, producing NaN prefill logprobs and ~0%
@@ -546,6 +593,37 @@ YAML
   echo "  serving data  : $SCRIPT_DIR/data (TP1 checkpoint, draft, caches)"
 }
 
+# vLLM's AOT compile cache key does not include DSV4_ABLATE_* or the
+# overlayed model.py FX graph. A cache compiled with ablation in-graph
+# then loaded with ABLATE=0 dies in inductor:
+#   assert_size_stride(arg5_1, (4096,), (1,))
+#   TypeError: expected Tensor()
+# Isolate (wipe) the on-disk AOT artifacts when the ablation stamp changes.
+sync_aot_cache_stamp() {
+  local cache_root="${SCRIPT_DIR}/cache/vllm/torch_compile_cache"
+  local stamp_file="${cache_root}/.dsv4_ablate_stamp"
+  local stamp="ablate=${ABLATE}|file=${DSV4_ABLATE_FILE}|lam=${DSV4_ABLATE_LAMBDA}|layers=${DSV4_ABLATE_LAYERS}|v2"
+  local old=""
+  mkdir -p "$cache_root"
+  if [ -f "$stamp_file" ]; then
+    old="$(cat "$stamp_file" || true)"
+  fi
+  if [ "$old" != "$stamp" ]; then
+    echo ">> AOT compile cache stamp changed (${old:-<none>} -> ${stamp}); wiping ${cache_root}"
+    # Keep the directory so the stamp can be rewritten; drop artifacts.
+    # Inductor writes these as root inside the container, so a host-user
+    # `rm -rf` hits Permission denied on files like inductor_cache/*.py.
+    if ! find "$cache_root" -mindepth 1 -maxdepth 1 ! -name '.dsv4_ablate_stamp' -exec rm -rf {} + 2>/dev/null; then
+      echo ">> host wipe hit root-owned cache files; retrying as root in docker"
+      docker run --rm --entrypoint /bin/bash \
+        -v "${cache_root}:/wipe" \
+        "${IMAGE_DIGEST}" \
+        -c 'find /wipe -mindepth 1 -maxdepth 1 ! -name .dsv4_ablate_stamp -exec rm -rf {} +'
+    fi
+    printf '%s\n' "$stamp" > "$stamp_file"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -555,6 +633,7 @@ cmd_start() {
   preflight
   mount_share
   generate_compose
+  sync_aot_cache_stamp
 
   echo ">> Pulling pinned image (first run only) and starting the server..."
   docker compose up -d
