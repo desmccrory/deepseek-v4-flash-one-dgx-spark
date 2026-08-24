@@ -867,21 +867,14 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
 
 # ---------------------------------------------------------------------------
-# Runtime refusal-direction ablation (opt-in; zero effect when unset).
+# Runtime refusal-direction ablation. Unset/empty DSV4_ABLATE_FILE = off
+# (no buffer). Draft layers reuse this class at indices >= 43
+# (prefix layers.{num_hidden_layers+i}) and miss the range gate.
 #
-# Applies  y <- y - lam * (y . v) v  to the wo_b output stream of decoder
-# layers in [lo, hi] — the runtime equivalent of the weight-space edit
-# W <- W - lam * v (v^T W) used by abliterated DeepSeek-V4-Flash releases
-# (drowzeys: layers 10-42, lam=3.5; lovesenko: all layers, lam=2.5). mHC
-# re-normalizes low-rank weight perturbations, but this projection is exact
-# for the wo_b output it acts on. Draft (DSpark) layers reuse this class
-# with layer indices >= num_hidden_layers (43+) and never match the range.
-#
-#   DSV4_ABLATE_FILE    in-container path to a .pt holding a unit-norm
-#                       4096-dim refusal direction (key 'broad' or
-#                       'directions'). Unset/empty -> feature fully off.
+#   DSV4_ABLATE_FILE    path to unit-norm 4096-d .pt (key 'broad' or
+#                       'directions')
 #   DSV4_ABLATE_LAMBDA  projection strength (default 3.5)
-#   DSV4_ABLATE_LAYERS  inclusive layer range 'lo-hi' (default '10-42')
+#   DSV4_ABLATE_LAYERS  inclusive 'lo-hi' (default '10-42')
 # ---------------------------------------------------------------------------
 _DSV4_ABLATE_FILE = os.environ.get("DSV4_ABLATE_FILE", "").strip() or None
 _DSV4_ABLATE_LAMBDA = float(os.environ.get("DSV4_ABLATE_LAMBDA", "3.5"))
@@ -923,12 +916,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         self.hidden_size = config.hidden_size
 
-        # Runtime refusal-direction ablation (see module comment above).
-        # When DSV4_ABLATE_FILE is unset this layer is byte-identical to
-        # stock (no extra buffer, no extra ops) so the AOT artifact matches
-        # a non-ablated compile. When set, every layer keeps a real
-        # (hidden_size,) tensor so the shared compiled graph never sees
-        # None (inductor assert_size_stride TypeError: expected Tensor()).
+        # FILE set: every layer registers a real buffer so the shared AOT
+        # graph never sees None. Unset: no buffer.
         self._ablate_lambda = 0.0
         if _DSV4_ABLATE_FILE is not None:
             self.register_buffer(
@@ -938,7 +927,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             self._init_refusal_ablation(prefix)
         else:
-            # Not a buffer: keep the compiled graph identical to stock.
             self._refusal_dir = None
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -1348,10 +1336,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     def _init_refusal_ablation(self, prefix: str) -> None:
-        """Load the refusal direction and enable this layer's ablation.
-
-        Gated on the target-model layer index parsed from the ``layers.N``
-        prefix, so the DSpark draft (indices >= 43) is never touched.
+        """Load v into this layer. Prefix ``layers.N`` is the gate so draft
+        layers (N >= num_hidden_layers, 43+) miss the range.
         """
         m = re.search(r"layers\.(\d+)$", prefix or "")
         if m is None:
@@ -1376,7 +1362,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         v = v.to(torch.float32)
         v = v / v.norm()
-        self._refusal_dir = v.contiguous()  # assign into the _buffers entry
+        self._refusal_dir = v.contiguous()
         self._ablate_lambda = _DSV4_ABLATE_LAMBDA
         logger.info_once(
             "DSV4 refusal ablation ON for %s (lambda=%s)",
@@ -1385,13 +1371,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     def _ablate_refusal_direction(self, x: torch.Tensor) -> torch.Tensor:
-        """Ablate the refusal direction from the wo_b output stream.
-
-        y <- y - lam * (y . v) v with unit-norm v: the runtime equivalent
-        of the wo_b weight edit W <- W - lam * v (v^T W). Disabled layers
-        keep v=0 and lambda=0, so this is an exact identity. Always runs
-        as tensor math (no None check) so every decoder layer matches the
-        same torch.compile/AOT graph signature.
+        """y <- y - lam * (y . v) v. Disabled layers keep v=0, lam=0
+        (identity). No None-check: every layer shares one AOT signature.
         """
         v = self._refusal_dir
         proj = (x.to(torch.float32) @ v).unsqueeze(-1)

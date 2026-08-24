@@ -3,6 +3,9 @@
 `direction_r1.pt` — a unit-norm 4096-dim refusal-direction tensor for
 the optional runtime ablation path (`ABLATE=1`, see the main README).
 
+Thank you [`drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-Anchored-Tensors`](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-Anchored-Tensors)
+for publishing this direction.
+
 Byte-identical (sha256 `6e4d8a8f3aa9e21795faab2c5b14d29b019acdf2ddbfbd8238430458a5837fe0`)
 to `results/refusal_direction_r1.pt` from
 [drowzeys/DeepSeek-V4-Flash-DSpark-Abliterated-Uncensored-1M-57toks](https://github.com/drowzeys/DeepSeek-V4-Flash-DSpark-Abliterated-Uncensored-1M-57toks),
