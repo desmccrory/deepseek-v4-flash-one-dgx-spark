@@ -283,6 +283,8 @@ Implementation notes:
 <details>
 <summary><b>About the EXL3/Trellis quantization</b></summary>
 
+**Who built EXL3:** [@turboderp_](https://x.com/turboderp_) and [@BrandonMusicKy](https://x.com/BrandonMusicKy) are the core people behind EXL3. The EXL3 path used here with vLLM is based on turboderp's ExLlama work and was adapted to this customized trellis quantization format by Brandon and other members of the RTX 6K Discord. See [Credits](#credits--links).
+
 This build ships **EXL3 3.0 bpw** weights (MCG codebook / Trellis `TR3` tier) on a **REAP-pruned K216** checkpoint that retains **216 of 256 experts** per MoE scope. Size: ~99.5 GiB. Non-routed tensors (attention, embeddings, output head, mHC, compressor, indexer) stay FP8/BF16. Two independent things are happening, and it's worth keeping them separate:
 
 - **REAP** decides *which* experts survive (quality impact roughly follows router top-k=6 coverage; low-saliency experts are dropped).
@@ -382,7 +384,9 @@ The 0xSero image is pinned and no newer build (with newer kernel commits) is pub
 
 ## Credits & links
 
-- Weights: [`0xSero/deepseek-v4-flash-0731-spark`](https://huggingface.co/0xSero/deepseek-v4-flash-0731-spark) (REAP-K216, EXL3 3.0 bpw, Trellis) and the upstream [`0xSero/DeepSeek-V4-Flash-0731-EXL3-3.0bpw`](https://huggingface.co/0xSero/DeepSeek-V4-Flash-0731-EXL3-3.0bpw)
+**EXL3** — [@turboderp_](https://x.com/turboderp_) and [@BrandonMusicKy](https://x.com/BrandonMusicKy) are the core people behind EXL3. The EXL3 path used here with vLLM is based on the work of turboderp (ExLlama) and was adapted to this customized trellis quantization format by Brandon and other members of the RTX 6K Discord. Format source: [`turboderp-org/exllamav3`](https://github.com/turboderp-org/exllamav3).
+
+- Hugging Face checkpoint this launcher downloads: [`0xSero/deepseek-v4-flash-0731-spark`](https://huggingface.co/0xSero/deepseek-v4-flash-0731-spark) (REAP-K216, EXL3 3.0 bpw, Trellis) and the upstream [`0xSero/DeepSeek-V4-Flash-0731-EXL3-3.0bpw`](https://huggingface.co/0xSero/DeepSeek-V4-Flash-0731-EXL3-3.0bpw). **That is the full extent of the 0xSero attribution — the hosted repo this recipe pulls weights from, not EXL3 itself.**
 - Runtime image: `ghcr.io/0xsero/deepseek-v4-flash-0731-spark-sparkinfer` (NVIDIA vLLM 26.02 base)
 - Kernel stack: [`local-inference-lab/b12x`](https://github.com/local-inference-lab/b12x) (sparkinfer / formerly b12x)
 - Design reference: [`MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark`](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark) (2-node TP2 recipe; our speed/KV work derives from its methodology)
